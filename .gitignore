@@ -1,0 +1,12 @@
+# venv: thousands of files, rebuildable with pip install
+.venv/
+
+# Python bytecode cache: ignore at any depth
+**/__pycache__/
+*.pyc
+*.pyo
+
+# Editor / OS junk
+.vscode/settings.json
+Thumbs.db
+desktop.ini
