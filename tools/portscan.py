@@ -1,8 +1,16 @@
 import socket
 import argparse
 import sys
+import ipaddress
+from concurrent.futures import ThreadPoolExecutor
+
+MAX_HOSTS = 1024
 
 class PortParseError(ValueError):
+
+    pass
+
+class TargetParseError(ValueError):
 
     pass
 
@@ -11,32 +19,37 @@ class Port:
     MIN = 1
     MAX = 65535
     def __init__(self, number, service=""):
+        #端口号必须在合法范围内
         if not (Port.MIN <= number <= Port.MAX):
-            raise PortParseError(f"port out of range ({Port.MIN}-{Port.MAX}): {number}")
+            raise PortParseError(f"Port out of range ({Port.MIN}-{Port.MAX}): {number}")
         self.number = number
         self.service = service
 
-
+    #拆解端口范围
     @classmethod
     def parse(cls, text):
         text = text.strip()
         if "-" in text:
             pieces = text.split("-")
 
+            #端口范围必须是两段
             if len(pieces) != 2:
-                raise PortParseError(f"invalid port range format: {text}")
+                raise PortParseError(f"Invalid port range format: {text}")
             try:
                 start, end = map(int, pieces)
+                #端口范围必须合法
             except ValueError:
-                raise PortParseError(f"invalid port range values: {text}")
+                raise PortParseError(f"Invalid port range values: {text}") from None
+                #端口范围必须不反向
             if start > end:
-                raise PortParseError(f"invalid port range: {text}")
+                raise PortParseError(f"Invalid port range: {text}")
             return [cls(n) for n in range(start, end + 1)]
         
         try: 
             n = int(text)
+            #端口范围必须合法
         except ValueError:
-            raise PortParseError(f"invalid port value: {text}") from None
+            raise PortParseError(f"Invalid port value: {text}") from None
         return [cls(n)]
 
     def __eq__(self, other):
@@ -56,8 +69,9 @@ class Port:
     @staticmethod
     def scan_port(host, port):
 
+        #排除非 Port 类型
         if not isinstance(port, Port):
-            raise TypeError(f"expected Port, got {type(port).__name__}")
+            raise TypeError(f"Expected Port, got {type(port).__name__}")
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(2)
             try:
@@ -66,6 +80,7 @@ class Port:
                 return False
             return True
 
+#去除重复端口
 def parse_ports(port_str):
     seen = set()
     result = []
@@ -77,12 +92,44 @@ def parse_ports(port_str):
             result.append(port)
     return result
 
+#返回 (host, port, 是否开放)
+def check_one(target):
+    host, port = target
+    return host, port, Port.scan_port(host, port)
+
+#解析目标，支持 CIDR 和主机名
+def parse_target(text):
+    if "/" in text:
+        try:
+            net = ipaddress.ip_network(text, strict=False)
+        except ValueError:
+            raise TargetParseError(f"Invalid CIDR: {text}") from None
+        if net.prefixlen >= 31:
+            n = net.num_addresses
+        else:
+            n = net.num_addresses - 2  #排除网络地址和广播地址
+        if n > MAX_HOSTS:
+            raise TargetParseError(f"CIDR too large: {text} ({n} hosts, max {MAX_HOSTS})")
+        return net.hosts()
+
+    try :
+        net = socket.gethostbyname(text)
+        return [net]
+    except socket.gaierror:
+        raise TargetParseError(f"Cannot resolve hostname: {text}")
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("target", help="Target host")
     parser.add_argument("-p", "--ports", required=True, help="Ports to scan (comma-separated)")
+    parser.add_argument("-t", "--threads", type=int, default=100, help="Number of threads")
     args = parser.parse_args()
-    host = args.target
+    target = args.target
+
+    if args.threads <= 0:
+        print(f"Error: threads must be positive, got {args.threads}", file=sys.stderr)
+        sys.exit(1)
+
     try:
         ports = parse_ports(args.ports)
     except PortParseError as e:
@@ -90,13 +137,17 @@ if __name__ == "__main__":
         sys.exit(1)
 
     try:
-        socket.gethostbyname(host)
-    except socket.gaierror:
-        print(f"Cannot resolve hostname: {host}")
-        sys.exit(1) 
+        targets = parse_target(target)
+    except TargetParseError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
-    for port in ports: 
-        if Port.scan_port(host, port):
-            print(f"{host}:{port} open")
-        else:
-            print(f"{host}:{port} closed")
+    #使用迭代器生成所有 (host, port) 组合，避免内存占用过大
+    jobs = ((str(host), port) for host in targets for port in ports)
+    #调用check_one(host, port)
+    with ThreadPoolExecutor(max_workers=args.threads) as executor:
+        results = executor.map(check_one, jobs)
+
+    for host, port, is_open in results:
+        state = "open" if is_open else "closed"
+        print(f"{host}:{port} {state}")
