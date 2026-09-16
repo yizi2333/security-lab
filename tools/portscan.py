@@ -3,6 +3,7 @@ import argparse
 import sys
 import ipaddress
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 
 MAX_HOSTS = 1024
 
@@ -67,13 +68,13 @@ class Port:
         return f"Port({self.number})"
 
     @staticmethod
-    def scan_port(host, port):
+    def scan_port(host, port, timeout):
 
         #排除非 Port 类型
         if not isinstance(port, Port):
             raise TypeError(f"Expected Port, got {type(port).__name__}")
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(2)
+            s.settimeout(timeout)
             try:
                 s.connect((host, port.number))
             except OSError:
@@ -93,9 +94,9 @@ def parse_ports(port_str):
     return result
 
 #返回 (host, port, 是否开放)
-def check_one(target):
+def check_one(target, timeout):
     host, port = target
-    return host, port, Port.scan_port(host, port)
+    return host, port, Port.scan_port(host, port, timeout)
 
 #解析目标，支持 CIDR 和主机名
 def parse_target(text):
@@ -123,12 +124,21 @@ if __name__ == "__main__":
     parser.add_argument("target", help="Target host")
     parser.add_argument("-p", "--ports", required=True, help="Ports to scan (comma-separated)")
     parser.add_argument("-t", "--threads", type=int, default=100, help="Number of threads")
+    parser.add_argument("--timeout", type=float, default=2, help="Connection timeout in seconds")
     args = parser.parse_args()
     target = args.target
+    timeout = args.timeout
+
 
     if args.threads <= 0:
         print(f"Error: threads must be positive, got {args.threads}", file=sys.stderr)
         sys.exit(1)
+
+    if args.timeout <= 0:
+        print(f"Error: timeout must be positive, got {args.timeout}", file=sys.stderr)
+        sys.exit(1)
+
+    worker = partial(check_one, timeout=args.timeout)
 
     try:
         ports = parse_ports(args.ports)
@@ -146,7 +156,7 @@ if __name__ == "__main__":
     jobs = ((str(host), port) for host in targets for port in ports)
     #调用check_one(host, port)
     with ThreadPoolExecutor(max_workers=args.threads) as executor:
-        results = executor.map(check_one, jobs)
+        results = executor.map(worker, jobs)
 
     for host, port, is_open in results:
         state = "open" if is_open else "closed"
