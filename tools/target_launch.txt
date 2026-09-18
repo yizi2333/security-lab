@@ -1,0 +1,2 @@
+PS C:\Users\yihai> cd D:\Code\security-lab
+>> .\.venv\Scripts\python.exe -m http.server 8080 --directory lab
