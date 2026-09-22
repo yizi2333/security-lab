@@ -11,12 +11,11 @@
 Thumbs.db
 desktop.ini
 
-# generated test lab and scan output (rebuildable via tools/setup_lab.py)
+# generated test lab (rebuildable via tools/setup_lab.py)
 lab/
+
+# generated / scanned test data and reports
+access*.log
 result*.txt
-
-# generated test data
-access.log
-access*.log
-
-access*.log
+report*.txt
+screen*.txt
