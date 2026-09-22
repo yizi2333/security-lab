@@ -10,12 +10,13 @@
 
 | 工具 | 说明 | 代码 |
 |---|---|---|
-| **端口扫描器** | 多线程 TCP 端口扫描，支持单 IP / 域名 / CIDR 网段 | `tools/portscan.py`（163 行） |
+| **端口扫描器** | 多线程 TCP 端口扫描，区分 open / closed / filtered 三态，支持单 IP / 域名 / CIDR 网段 | `tools/portscan.py`（204 行） |
 | **目录扫描器** | 字典驱动的 Web 路径枚举，区分状态码、识别敏感文件 | `tools/dirscan.py`（123 行） |
 | **日志分析器** | 解析 Web access log，统计访问特征并识别 4 类攻击行为 | `tools/loganalyze.py`（175 行） |
 | 日志生成器 | 生成带「埋入攻击特征」的测试日志，作为分析器的验收基准 | `tools/genlog.py`（212 行） |
 | 靶场生成 | 一键生成本地测试网站和字典 | `tools/setup_lab.py` |
-| 自测脚本 | 端口扫描器的 22 个自动化测试用例 | `tools/selftest.py` |
+| 自测脚本 | 端口扫描器的 23 个自动化测试用例 | `tools/selftest.py` |
+| 中断测试 | Ctrl+C 中断的回归测试（selftest 覆盖不到） | `tools/interrupt_test.py` |
 
 **核心思路：** 三个工具不是孤立的练习，而是一条链路 ——
 
@@ -62,6 +63,61 @@ python tools/portscan.py 192.168.1.0/24 -p 22,80,443 -t 100 --timeout 2
 |---|---|---|
 | `-t 1` | 60.39s | 1.0x |
 | `-t 100` | **2.13s** | **28x** |
+
+#### 三种端口状态
+
+扫描结果不是「开」和「关」两种：
+
+| 状态 | 含义 | 怎么判定 |
+|---|---|---|
+| `open` | 三次握手成功，有服务在监听 | 连接成功 |
+| `closed` | 对端明确回了 **RST**，确实没人监听 | `ConnectionRefusedError` |
+| `filtered` | 对端**一声不吭**直到超时 | `TimeoutError` |
+
+`filtered` 是最容易被写错的一个 —— 它只说明「我们没收到回复」，可能是防火墙丢包，也可能只是网络不通。**把它当成 `closed` 就是在撒谎**：工具并不知道那边到底有没有服务。
+
+因为扫一个被防火墙挡住的网段会刷出几千行 `filtered`，默认**不打印**，要看得加 `--show-filtered`：
+
+```bash
+python tools/portscan.py 127.0.0.1 -p 135,9999 --timeout 1
+# 127.0.0.1:135 open
+# Done: 2 ports scanned          <- 只打印了 1 行，但确实扫了 2 个
+
+python tools/portscan.py 127.0.0.1 -p 135,9999 --timeout 1 --show-filtered
+# 127.0.0.1:135 open
+# 127.0.0.1:9999 filtered
+```
+
+注意 `Done: N ports scanned` 里的 N 统计的是**扫过多少**，不是**打印几行**。这两件事必须分开，否则 Ctrl+C 中断时报的数字就是假的。
+
+#### 为什么本机测不出 `closed`
+
+本机（Windows）的回环口对没人监听的端口是**丢包**而不是回 RST：
+
+```
+127.0.0.1:18080 -> OPEN (0.00s)              # 真有监听：秒回
+127.0.0.1:9999  -> TIMEOUT(dropped)  (0.61s) # 没监听：耗满 timeout
+```
+
+所以要观察 `closed`，得去真 Linux 里跑（借用已有的 Docker 镜像，不用装东西）：
+
+```powershell
+docker run --rm -v D:/Code/security-lab:/lab -w /lab rockchin/langbot sh -c 'python3 -m http.server 18080 >/dev/null 2>&1 & sleep 1; python3 tools/portscan.py 127.0.0.1 -p 18080,9999,1-3 --timeout 2'
+# 127.0.0.1:18080 open
+# 127.0.0.1:9999 closed
+# ...
+```
+
+Windows 上只能观察到 `open` / `filtered`，Linux 上能观察到 `open` / `closed` —— **两边合起来才覆盖全三个分支**。
+
+#### 中断与 Ctrl+C
+
+`executor.map` 换成 `as_completed` 才能做到「按 Ctrl+C 立刻看到已扫完的结果」：`map` 按**提交顺序**交付，一个慢任务会卡住整条结果流。代价是**输出顺序 = 完成顺序**，不再是端口号顺序。
+
+```bash
+python tools/selftest.py          # 23 个功能用例
+python tools/interrupt_test.py    # Ctrl+C 中断回归（退出码 130 + 计数正确性）
+```
 
 ### ② 目录扫描器
 
@@ -172,6 +228,9 @@ python tools/loganalyze.py access.log --top 10 -o report.txt
 | `access.log` 加进 `.gitignore` 却还生效 | 文件仍被跟踪 | **忽略规则对已跟踪的文件无效**，要 `git rm --cached` |
 | `requests.get` 的 `allow_redirects` | 永远看不到 3xx | 默认 `True`，自动跟随重定向 |
 | Windows 上 `open()` 不写 encoding | 中文内容乱码/报错 | 默认用 GBK |
+| `except OSError` 吞掉了 `TimeoutError` | 连接超时被报成 `closed`，**看起来一切正常** | `TimeoutError` 是 `OSError` 的子类，先匹配 `OSError` 就永远轮不到它 |
+| 测试套件把 bug 固化成期望值 | 修好代码后 3 个用例反而失败 | 早期用例写的 `127.0.0.1:1 closed` 记录的正是上面那个 bug |
+| Ctrl+C 计数与打印行数绑在一起 | `filtered` 一隐藏，中断时报的数字就少了一大截 | 计数器必须在「决定打不打印」之前加 |
 
 ---
 
@@ -180,13 +239,14 @@ python tools/loganalyze.py access.log --top 10 -o report.txt
 | 文件 | 行数 |
 |---|---|
 | `tools/genlog.py` | 212 |
+| `tools/portscan.py` | 204 |
 | `tools/loganalyze.py` | 175 |
 | `tools/setup_lab.py` | 166 |
-| `tools/portscan.py` | 163 |
 | `tools/dirscan.py` | 123 |
-| `tools/selftest.py` | 100 |
+| `tools/selftest.py` | 117 |
+| `tools/interrupt_test.py` | 101 |
 | `tools/slow_lab.py` | 36 |
-| **合计** | **975 行** |
+| **合计** | **1134 行** |
 
 ---
 

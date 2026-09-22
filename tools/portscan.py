@@ -70,6 +70,14 @@ class Port:
 
     @staticmethod
     def scan_port(host, port, timeout):
+        """返回 "open" / "closed" / "filtered"。
+
+        open     : 三次握手成功。
+        closed   : 对端回了 RST, 确实没有程序在监听。
+        filtered : 对端一声不吭直到超时。可能是防火墙丢包,
+                   也可能只是网络不通 —— 总之【我们不知道】,
+                   所以不能谎报成 closed。
+        """
 
         #排除非 Port 类型
         if not isinstance(port, Port):
@@ -78,9 +86,14 @@ class Port:
             s.settimeout(timeout)
             try:
                 s.connect((host, port.number))
+            #TimeoutError 必须排在 OSError 前面:
+            #它是 OSError 的子类, 顺序写反的话这条永远匹配不到,
+            #而且不会报错 —— 只会静默地把 filtered 全算成 closed。
+            except TimeoutError:
+                return "filtered"
             except OSError:
-                return False
-            return True
+                return "closed"
+            return "open"
 
 #去除重复端口
 def parse_ports(port_str):
@@ -94,7 +107,7 @@ def parse_ports(port_str):
             result.append(port)
     return result
 
-#返回 (host, port, 是否开放)
+#返回 (host, port, 状态)，状态是 "open" / "closed" / "filtered" 之一
 def check_one(target, timeout):
     host, port = target
     return host, port, Port.scan_port(host, port, timeout)
@@ -126,6 +139,9 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--ports", required=True, help="Ports to scan (comma-separated)")
     parser.add_argument("-t", "--threads", type=int, default=100, help="Number of threads")
     parser.add_argument("--timeout", type=float, default=2, help="Connection timeout in seconds")
+    parser.add_argument("--show-filtered", action="store_true",
+                        help="Also print ports that never answered (filtered); "
+                             "hidden by default because they can flood the output")
     args = parser.parse_args()
     target = args.target
     timeout = args.timeout
@@ -166,10 +182,14 @@ if __name__ == "__main__":
         #   所以中断时能看到真实进度(代价是输出不按输入顺序)。
         futures = [executor.submit(worker, job) for job in jobs]
         for fut in as_completed(futures):
-            host, port, is_open = fut.result()
-            state = "open" if is_open else "closed"
-            print(f"{host}:{port} {state}")
+            host, port, state = fut.result()
+            #done 统计的是【扫过的】端口数, 跟打印了几行无关。
+            #必须放在 continue 之前, 否则 Ctrl+C 时的
+            #"N ports scanned" 就变成"打印了几行", 又开始撒谎了。
             done += 1
+            if state == "filtered" and not args.show_filtered:
+                continue
+            print(f"{host}:{port} {state}")
     except KeyboardInterrupt:
         # Ctrl+C: 取消还没开始的任务, 不等它们
         executor.shutdown(wait=False, cancel_futures=True)

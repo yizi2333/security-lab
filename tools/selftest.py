@@ -14,15 +14,25 @@ PY = sys.executable
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, "portscan.py")
 
-# (命令行参数, 期望退出码, 期望输出里必须包含的字符串列表, 说明)
+# (命令行参数, 期望退出码, 期望输出里必须包含的字符串列表, 说明[, 绝不能出现的字符串列表])
+#
+# 注意 "closed" 和 "filtered" 的区别, 以及为什么本机测不出 closed:
+#   本机回环口对没人监听的端口是【丢包】而不是回 RST,
+#   所以 127.0.0.1 上的空端口全是 filtered。
+#   要观察 closed, 得去真 Linux 里跑(见 README 的容器命令)。
 CASES = [
     (["127.0.0.1", "-p", "135"], 0, ["127.0.0.1:135 open"], "单个开放端口"),
-    (["127.0.0.1", "-p", "1"], 0, ["127.0.0.1:1 closed"], "单个关闭端口"),
+    (["127.0.0.1", "-p", "1", "--show-filtered"], 0,
+     ["127.0.0.1:1 filtered"], "单个无响应端口 -> filtered(不是 closed)"),
     (["127.0.0.1", "-p", "135,445"], 0, ["127.0.0.1:135 open", "127.0.0.1:445 open"], "两个端口"),
-    (["127.0.0.1", "-p", "8000-8003"], 0, ["127.0.0.1:8000 closed",
-                                           "127.0.0.1:8001 closed",
-                                           "127.0.0.1:8002 closed",
-                                           "127.0.0.1:8003 closed"], "端口范围展开成 4 个"),
+    (["127.0.0.1", "-p", "8000-8003", "--show-filtered"], 0,
+     ["127.0.0.1:8000 filtered",
+      "127.0.0.1:8001 filtered",
+      "127.0.0.1:8002 filtered",
+      "127.0.0.1:8003 filtered"], "端口范围展开成 4 个"),
+    (["127.0.0.1", "-p", "8000-8003"], 0, ["Done: 4 ports scanned"],
+     "filtered 默认不打印, 但仍计入扫描数",
+     ["127.0.0.1:8000 filtered"]),
     (["127.0.0.1", "-p", "135-135"], 0, ["127.0.0.1:135"], "退化范围只扫一个"),
     (["127.0.0.1", "-p", "abc"], 1, ["Error"], "非数字 -> 友好报错"),
     (["127.0.0.1", "-p", "99999"], 1, ["Error"], "超范围 -> 友好报错"),
@@ -63,7 +73,11 @@ def run(args, limit=30):
 
 def main():
     failed = 0
-    for args, want_rc, want_text, desc in CASES:
+    for case in CASES:
+        args, want_rc, want_text, desc = case[:4]
+        #第 5 项可选: 输出里【绝不能】出现的字符串
+        must_not = case[4] if len(case) > 4 else []
+
         rc, out, timed_out = run(args)
 
         problems = []
@@ -74,6 +88,9 @@ def main():
         for t in want_text:
             if t not in out:
                 problems.append(f"输出里缺少 {t!r}")
+        for bad in must_not:
+            if bad in out:
+                problems.append(f"输出里不该出现 {bad!r}")
         for bad in FORBIDDEN:
             if bad in out:
                 problems.append(f"输出里出现了不该有的 {bad!r}")
