@@ -1,8 +1,9 @@
 import socket
 import argparse
 import sys
+import signal
 import ipaddress
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
 
 MAX_HOSTS = 1024
@@ -155,9 +156,29 @@ if __name__ == "__main__":
     #使用迭代器生成所有 (host, port) 组合，避免内存占用过大
     jobs = ((str(host), port) for host in targets for port in ports)
     #调用check_one(host, port)
-    with ThreadPoolExecutor(max_workers=args.threads) as executor:
-        results = executor.map(worker, jobs)
+    executor = ThreadPoolExecutor(max_workers=args.threads)
+    done = 0
+    try:
+        # 用 as_completed 而不是 map:
+        #   map 按【提交顺序】交付, 一个慢任务会卡住整条结果流,
+        #   导致 Ctrl+C 时可能一个结果都还没拿到。
+        #   as_completed 按【完成顺序】交付, 谁先扫完谁先打印,
+        #   所以中断时能看到真实进度(代价是输出不按输入顺序)。
+        futures = [executor.submit(worker, job) for job in jobs]
+        for fut in as_completed(futures):
+            host, port, is_open = fut.result()
+            state = "open" if is_open else "closed"
+            print(f"{host}:{port} {state}")
+            done += 1
+    except KeyboardInterrupt:
+        # Ctrl+C: 取消还没开始的任务, 不等它们
+        executor.shutdown(wait=False, cancel_futures=True)
+        print()
+        print(f"Interrupted: {done} ports scanned before you pressed Ctrl+C",
+              file=sys.stderr)
+        sys.exit(128 + signal.SIGINT)
+    else:
+        executor.shutdown(wait=True)
 
-    for host, port, is_open in results:
-        state = "open" if is_open else "closed"
-        print(f"{host}:{port} {state}")
+    print()
+    print(f"Done: {done} ports scanned")
