@@ -154,7 +154,8 @@ def main():
 
     entries = []
 
-    users = [f"192.168.1.{random.randint(2, 254)}" for _ in range(NUM_USERS)]
+    users = random.sample(range(2, 255), NUM_USERS)     # 不重复抽样
+    users = [f"192.168.1.{n}" for n in users]
     # 时间窗口
     start = datetime(2026, 9, 17, 10, 0, 0)
     end = datetime(2026, 9, 17, 12, 0, 0)
