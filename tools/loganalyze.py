@@ -29,7 +29,10 @@ BRUTE_PATHS = ["/admin/login.php", "/wp-login.php", "/login", "/admin/"]
 
 SCAN_404_THRESHOLD = 10
 BRUTE_THRESHOLD = 10
-
+# 同一个 IP 这个次数以上出现 "password=" 在 URL 里 -> 疑似爆破
+PWD_IN_URL_THRESHOLD = 10
+SQLI_KEYWORDS = ['union', 'select', 'order by']
+SQLI_THRESHOLD = 1
 
 def main():
     parser = argparse.ArgumentParser()
@@ -50,9 +53,13 @@ def main():
     status_counter = Counter()
     ip_404_counter = Counter()
     ua_counter = Counter()
+    ip_sqli = Counter()
     ip_ua = {}
     ip_brute = Counter()
     ip_sensitive = Counter()
+    ip_ua_hit = Counter()      # 真正命中扫描器 UA 的请求数(按 IP)
+    ip_pwd = Counter()         # URL 查询串里含 password= 的请求数(按 IP)
+    internal = 0               # 服务器内部连接(OPTIONS *), 不是用户流量
     with open(args.logfile, encoding="utf-8", errors="replace") as f:
         for line in f:
             line = line.rstrip("\n")
@@ -63,9 +70,15 @@ def main():
             if not m:
                 bad += 1
                 continue
+            # 请求目标是 "*" 的, 是服务器自己发的内部连接(OPTIONS *),
+            # 不是用户流量。单独计数, 不能混进 bad —— bad 的意思是"解析失败"。
+            if m.group("path") == "*":
+                internal += 1
+                continue
             ip = m.group("ip")
             status = m.group("status")
-            path = urlsplit(m.group("path")).path
+            target = urlsplit(m.group("path"))
+            path = target.path
             ua = m.group("ua") or ""
             try:
                 dt = datetime.strptime(m.group("time"), TIME_FMT)
@@ -78,12 +91,22 @@ def main():
             status_counter[status] += 1
             ua_counter[ua] += 1
             ip_ua.setdefault(ip, set()).add(ua)
+            # 只有真正带扫描器特征的请求才计数 (原来错用了 ip_counter[ip])
+            low_ua = ua.lower()
+            if any(kw in low_ua for kw in SUSPICIOUS_UA):
+                ip_ua_hit[ip] += 1
+            # 凭据出现在 URL 查询串里
+            if "password=" in target.query.lower():
+                ip_pwd[ip] += 1
             if status == "404":
                 ip_404_counter[ip] += 1
             if path in BRUTE_PATHS:
                 ip_brute[ip] += 1
             if any(path.startswith(s) for s in SENSITIVE_PATHS):
                 ip_sensitive[ip] += 1
+            low_query = target.query.lower()
+            if '%27' in low_query and any(kw in low_query for kw in SQLI_KEYWORDS):
+                ip_sqli[ip] += 1
             ok += 1
 
     def emit(text=""):
@@ -95,6 +118,7 @@ def main():
     try:
         emit(f"总请求数   : {ok}")
         emit(f"跳过行数   : {bad}")
+        emit(f"内部连接数 : {internal}   (OPTIONS *, 服务器自己发的, 不算用户流量)")
         emit(f"独立 IP 数 : {len(ip_counter)}")
         emit()
         emit(f"Top {args.top} 访问 IP:")
@@ -150,9 +174,12 @@ def main():
                         hits.add(kw)
             if hits:
                 found = True
-                n_req = ip_counter[ip]
-                emit(f"    {ip:16} {n_req:>5} 次请求   命中 {len(hits)} 种: "
-                     f"{','.join(sorted(hits))}")
+                # 这里必须用"真正命中扫描器 UA 的请求数",
+                # 而不是这个 IP 的总请求数 —— 否则报告会把正常流量算成攻击。
+                n_hit = ip_ua_hit[ip]
+                n_all = ip_counter[ip]
+                emit(f"    {ip:16} {n_hit:>5} 次命中(该 IP 共 {n_all} 次请求)"
+                     f"   命中 {len(hits)} 种: {','.join(sorted(hits))}")
         if not found:
             emit("    未发现")
 
@@ -166,7 +193,30 @@ def main():
             emit("    未发现")
 
         emit()
+        emit(f"[5] 凭据出现在 URL 中(查询串含 password= , >= {PWD_IN_URL_THRESHOLD} 次)")
+        hits = [(ip, n) for ip, n in ip_pwd.most_common()
+                if n >= PWD_IN_URL_THRESHOLD]
+        if hits:
+            for ip, n in hits:
+                emit(f"    {ip:16} {n:>5} 次")
+        else:
+            emit("    未发现")
+        emit("    说明: 凭据出现在 URL 里本身就是缺陷(会被 access log、")
+        emit("          浏览器历史、Referer 记录)。高频出现则是爆破特征。")
+        emit("          这里无法区分「正常 GET 登录」和「爆破」—— 只能靠频率。")
+
+        emit()
+        emit(f"[6] SQL注入探测(查询串含 '以及UNION , >= {SQLI_THRESHOLD} 次)")
+        sql_hits = [(ip, n) for ip, n in ip_sqli.most_common()
+                    if n >= SQLI_THRESHOLD]
+        if sql_hits:
+            for ip, n in sql_hits:
+                emit(f"    {ip:16} {n:>5} 次")
+        else:
+            emit("    未发现")
+
         emit("=" * 62)
+        emit()
     finally:
         if out_file is not None:
             out_file.close()
